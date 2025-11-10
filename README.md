@@ -151,16 +151,33 @@ s3_bucket         = demo-aws-app-static-a1b2c3d4
 ## 🔍 Testing
 
 1. **Visit CloudFront:**
+
    ```
    https://<cloudfront_domain>/
    ```
    → should show your `index.html`.
 
-2. **Test the Lambda API:**
-   ```bash
-   curl -i "https://$(terraform output -raw cloudfront_domain)/api/test"
-   ```
-   → returns `{ "message": "Hello from Lambda" }`.
+2. **Test the EC2/ALB Application:**
+
+    ```bash
+    curl -i "https://$(terraform output -raw cloudfront_domain)/app/"
+    ```
+
+    → should return the NGINX welcome page or your custom application response.
+
+    **Alternative - Direct ALB access:**
+
+    ```bash
+    curl -i "http://$(terraform output -raw alb_dns_name)/"
+    ```
+
+    → bypasses CloudFront and hits the ALB directly.
+
+3. **Test the Lambda API:**
+    ```bash
+    curl -i "https://$(terraform output -raw cloudfront_domain)/api/test"
+    ```
+    → returns `{ "message": "Hello from Lambda" }`.
 
 ---
 

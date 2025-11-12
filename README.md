@@ -15,7 +15,7 @@ It includes both **static and dynamic content delivery**, **scalable compute**, 
 | **Serverless API** | **Lambda + API Gateway (HTTP API)** | Handles `/api/*` requests using a lightweight serverless function |
 | **Networking** | **VPC + Subnets + IGW** | Provides network isolation and public access via two subnets in different AZs |
 | **Security** | **Security Groups** | Control inbound/outbound traffic for ALB and EC2 instances |
-
+| **Database** | **DynamoDB** | For learning purposes, for lambda+ec2 use case
 ---
 
 ## ⚙️ Key Terraform Components
@@ -129,7 +129,7 @@ Approve when prompted (`yes`).
 
 ## 🧾 Outputs
 
-After successful deployment, Terraform prints:
+After successful deployment, Terraform prints (main ones, lambda+ec2 use case ones are excluded):
 
 | Output | Description |
 |:--------|:-------------|
@@ -160,7 +160,7 @@ s3_bucket         = demo-aws-app-static-a1b2c3d4
 2. **Test the EC2/ALB Application:**
 
     ```bash
-    curl -i "https://$(terraform output -raw cloudfront_domain)/app/"
+    curl -i "https://$(terraform output -raw cloudfront_domain)/app/health"
     ```
 
     → should return the NGINX welcome page or your custom application response.
@@ -168,7 +168,7 @@ s3_bucket         = demo-aws-app-static-a1b2c3d4
     **Alternative - Direct ALB access:**
 
     ```bash
-    curl -i "http://$(terraform output -raw alb_dns_name)/"
+    curl -i "http://$(terraform output -raw alb_dns_name)/health"
     ```
 
     → bypasses CloudFront and hits the ALB directly.
@@ -178,6 +178,11 @@ s3_bucket         = demo-aws-app-static-a1b2c3d4
     curl -i "https://$(terraform output -raw cloudfront_domain)/api/test"
     ```
     → returns `{ "message": "Hello from Lambda" }`.
+
+4. **Test the EC2+Lambda Use Case**
+    ```bash
+    ./test-api.sh
+    ```
 
 ---
 

@@ -63,6 +63,60 @@ resource "aws_route_table_association" "public" {
 # ALB + EC2 + ASG     #
 #######################
 
+# IAM role for EC2 instances
+resource "aws_iam_role" "ec2_role" {
+  name = "${local.project}-ec2-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+# IAM policy for EC2 to access DynamoDB and invoke Lambda
+resource "aws_iam_role_policy" "ec2_policy" {
+  name = "${local.project}-ec2-policy"
+  role = aws_iam_role.ec2_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:PutItem",
+          "dynamodb:GetItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:Scan",
+          "dynamodb:Query"
+        ]
+        Resource = aws_dynamodb_table.image_metadata.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "lambda:InvokeFunction"
+        ]
+        Resource = aws_lambda_function.processor.arn
+      }
+    ]
+  })
+}
+
+# Instance profile for EC2
+resource "aws_iam_instance_profile" "ec2_profile" {
+  name = "${local.project}-ec2-profile"
+  role = aws_iam_role.ec2_role.name
+}
+
 resource "aws_security_group" "alb" {
   name        = "${local.project}-alb-sg"
   description = "Allow HTTP from anywhere"
@@ -117,14 +171,18 @@ resource "aws_launch_template" "web" {
   name_prefix   = "${local.project}-lt-"
   image_id      = data.aws_ami.amazon_linux.id
   instance_type = "t3.micro"
-  user_data = base64encode(<<-EOF
-              #!/bin/bash
-              dnf -y install nginx
-              echo "<h1>${local.project} - EC2</h1>" > /usr/share/nginx/html/index.html
-              systemctl enable nginx
-              systemctl start nginx
-            EOF
-  )
+  
+  iam_instance_profile {
+    name = aws_iam_instance_profile.ec2_profile.name
+  }
+  
+  user_data = base64encode(templatefile("${path.module}/app/user_data.sh", {
+    dynamodb_table   = aws_dynamodb_table.image_metadata.name
+    lambda_processor = aws_lambda_function.processor.function_name
+    region          = var.region
+    api_code         = file("${path.module}/app/api.py") # variable for the shell script
+  }))
+  
   vpc_security_group_ids = [aws_security_group.ec2.id]
   tags = { Name = "${local.project}-lt" }
 }
@@ -176,6 +234,16 @@ resource "aws_autoscaling_group" "web" {
   target_group_arns = [aws_lb_target_group.app.arn]
   health_check_type = "ELB"
 
+  # Automatically roll instances when the Launch Template changes (e.g., user_data)
+  instance_refresh {
+    strategy = "Rolling"
+    triggers = ["launch_template"]
+    preferences {
+      min_healthy_percentage = 50
+      instance_warmup        = 60
+    }
+  }
+
   tag {
     key                 = "Name"
     value               = "${local.project}-web"
@@ -194,6 +262,23 @@ resource "random_id" "suffix" {
 resource "aws_s3_bucket" "static" {
   bucket = "${local.project}-static-${random_id.suffix.hex}"
   tags   = { Name = "${local.project}-static" }
+}
+
+################
+# DynamoDB     #
+################
+
+resource "aws_dynamodb_table" "image_metadata" {
+  name         = "${local.project}-image-metadata"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "imageId"
+
+  attribute {
+    name = "imageId"
+    type = "S"
+  }
+
+  tags = { Name = "${local.project}-image-metadata" }
 }
 
 # Block public access at the bucket level
@@ -244,6 +329,38 @@ resource "aws_iam_role_policy_attachment" "lambda_basic" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
+# IAM role for the processor Lambda
+resource "aws_iam_role" "lambda_processor" {
+  name               = "${local.project}-lambda-processor-role"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_processor_basic" {
+  role       = aws_iam_role.lambda_processor.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+# Policy for processor Lambda to access DynamoDB
+resource "aws_iam_role_policy" "lambda_processor_policy" {
+  name = "${local.project}-lambda-processor-policy"
+  role = aws_iam_role.lambda_processor.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:UpdateItem",
+          "dynamodb:GetItem",
+          "dynamodb:PutItem"
+        ]
+        Resource = aws_dynamodb_table.image_metadata.arn
+      }
+    ]
+  })
+}
+
 # Create zip from external Python file
 data "archive_file" "lambda_zip" {
   type        = "zip"
@@ -258,6 +375,30 @@ resource "aws_lambda_function" "hello" {
   runtime          = "python3.12"
   filename         = data.archive_file.lambda_zip.output_path
   source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+}
+
+# Processor Lambda for ML image analysis
+data "archive_file" "lambda_processor_zip" {
+  type        = "zip"
+  source_file = "${path.module}/lambda_processor/handler.py"
+  output_path = "${path.module}/lambda_processor.zip"
+}
+
+resource "aws_lambda_function" "processor" {
+  function_name    = "${local.project}-image-processor"
+  role             = aws_iam_role.lambda_processor.arn
+  handler          = "handler.handler"
+  runtime          = "python3.12"
+  filename         = data.archive_file.lambda_processor_zip.output_path
+  source_code_hash = data.archive_file.lambda_processor_zip.output_base64sha256
+  timeout          = 60  # 60 seconds for image processing
+  memory_size      = 512 # 512 MB memory
+
+  environment {
+    variables = {
+      DYNAMODB_TABLE_NAME = aws_dynamodb_table.image_metadata.name
+    }
+  }
 }
 
 # API Gateway (HTTP API)
@@ -392,15 +533,36 @@ resource "aws_cloudfront_distribution" "cdn" {
   }
 
   # /app/* -> ALB
-  ordered_cache_behavior {
-    path_pattern             = "/app/*"
-    target_origin_id         = "alb-app"
-    viewer_protocol_policy   = "redirect-to-https"
-    allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
-    cached_methods           = ["GET", "HEAD"]
-    cache_policy_id          = data.aws_cloudfront_cache_policy.disabled.id
-    origin_request_policy_id = data.aws_cloudfront_origin_request_policy.allviewer.id
-  }
+    ordered_cache_behavior {
+      path_pattern             = "/app/*"
+      target_origin_id         = "alb-app"
+      viewer_protocol_policy   = "allow-all" # Allow both HTTP and HTTPS from CloudFront to ALB
+      allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+      cached_methods           = ["GET", "HEAD"]
+      cache_policy_id          = data.aws_cloudfront_cache_policy.disabled.id
+      origin_request_policy_id = data.aws_cloudfront_origin_request_policy.allviewer.id # Forwards all headers including Host
+
+      function_association {
+        event_type   = "viewer-request"
+        function_arn = aws_cloudfront_function.strip_app_prefix.arn
+      }
+    }
+
+    # /app (no wildcard) -> ALB
+    ordered_cache_behavior {
+      path_pattern             = "/app"
+      target_origin_id         = "alb-app"
+      viewer_protocol_policy   = "allow-all"
+      allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+      cached_methods           = ["GET", "HEAD"]
+      cache_policy_id          = data.aws_cloudfront_cache_policy.disabled.id
+      origin_request_policy_id = data.aws_cloudfront_origin_request_policy.allviewer.id
+
+      function_association {
+        event_type   = "viewer-request"
+        function_arn = aws_cloudfront_function.strip_app_prefix.arn
+      }
+    }
 
   # /api/* -> API Gateway
   ordered_cache_behavior {
@@ -422,6 +584,35 @@ resource "aws_cloudfront_distribution" "cdn" {
   }
 
   tags = { Name = "${local.project}-cdn" }
+}
+
+###############################
+# CloudFront Function: /app -> /
+###############################
+
+resource "aws_cloudfront_function" "strip_app_prefix" {
+  name    = "${local.project}-strip-app-prefix"
+  runtime = "cloudfront-js-1.0"
+  comment = "Strip /app prefix so backend sees root paths"
+  publish = true
+
+  code = <<-EOT
+    function handler(event) {
+      var req = event.request;
+      // Exact match /app -> /
+      if (req.uri === '/app' || req.uri === '/app/') {
+        req.uri = '/';
+        return req;
+      }
+      // Prefix match /app/* -> /*
+      if (req.uri.startsWith('/app/')) {
+        req.uri = req.uri.substring(4); // remove '/app'
+        if (req.uri === '') req.uri = '/';
+        return req;
+      }
+      return req;
+    }
+  EOT
 }
 
 #############################################
